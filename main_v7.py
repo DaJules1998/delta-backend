@@ -1,18 +1,37 @@
 import os
 import json
 import tempfile
-import fitz  # PyMuPDF für schnelle PDF-Textextraktion
-from fastapi import FastAPI, UploadFile, File, Form
+from datetime import datetime
+import fitz  # PyMuPDF
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from openai import OpenAI
 
-# --- 1. SETUP CLOUD-READY ---
+# --- NEUE IMPORTS FÜR DB & AUTH ---
+from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+
+# --- 1. SETUP & DATENBANK ---
 api_key = os.environ.get("OPENAI_API_KEY")
 client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
-app = FastAPI()
+# Datenbank-Setup (SQLite für MVP)
+SQLALCHEMY_DATABASE_URL = "sqlite:///./delta_checker.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
 
+# Auth-Setup
+SECRET_KEY = "dein-super-geheimer-mvp-schluessel-bitte-spaeter-aendern"
+ALGORITHM = "HS256"
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login", auto_error=False)
+
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -21,7 +40,93 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- 2. DAS GEHIRN (Dein Few-Shot Spickzettel) ---
+# --- 2. DATENBANK MODELLE ---
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    username = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+
+class Report(Base):
+    __tablename__ = "reports"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    filename = Column(String)
+    agent_type = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    result_json = Column(Text) # Speichert die extrahierten Items
+
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- 3. AUTHENTIFIZIERUNGS LOGIK ---
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+    except JWTError:
+        return None
+    return db.query(User).filter(User.username == username).first()
+
+# --- 4. API-ROUTEN (ACCOUNT & HISTORIE) ---
+@app.post("/api/register")
+def register(user_data: dict, db: Session = Depends(get_db)):
+    username = user_data.get("username")
+    password = user_data.get("password")
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(status_code=400, detail="Benutzername bereits vergeben.")
+    
+    new_user = User(username=username, hashed_password=get_password_hash(password))
+    db.add(new_user)
+    db.commit()
+    return {"message": "Account erfolgreich erstellt!"}
+
+@app.post("/api/login")
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == form_data.username).first()
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Falscher Benutzername oder Passwort")
+    access_token = create_access_token(data={"sub": user.username})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.get("/api/history")
+def get_history(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    if not current_user:
+        raise HTTPException(status_code=401, detail="Nicht eingeloggt")
+    reports = db.query(Report).filter(Report.user_id == current_user.id).order_by(Report.created_at.desc()).all()
+    
+    history = []
+    for r in reports:
+        history.append({
+            "id": r.id,
+            "filename": r.filename,
+            "type": r.agent_type,
+            "date": r.created_at.strftime("%d.%m.%Y %H:%M"),
+            "items": json.loads(r.result_json)
+        })
+    return {"history": history}
+
+# --- 5. DAS KI-GEHIRN (VOLLSTÄNDIGER PROMPT) ---
 SYSTEM_PROMPT = """Du bist ein österreichischer Bauingenieur (HTL Hochbau/Baumeister) und Prüfer.
 Analysiere den Text und finde JEDE EINZELNE bautechnische Nachweispflicht. 
 
@@ -31,41 +136,52 @@ Wenn der übergebene Text absolut NICHTS mit dem Bauwesen, Ausschreibungen oder 
 
 WICHTIGSTE REGELN ZU POSITIONSNUMMERN (z.B. nach LB-HB):
 1. ÖSTERREICHISCHE POSITIONEN SIND 6-STELLIG: Eine exakte Position besteht aus 6 Ziffern und oft einem Buchstaben am Ende. Beispiele: "00.10.17", "03.12.04" oder "00.10.25.A".
-2. ABSOLUTES BÜNDELUNGSVERBOT: Du darfst NIEMALS Dokumente auf Obergruppen zusammenfassen! Du musst IMMER die exakte, 6-stellige Nummer aus dem Text suchen. 
+2. ABSOLUTES BÜNDELUNGSVERBOT: Du darfst NIEMALS Dokumente auf Obergruppen (wie "Pos 02" oder "Pos 03") zusammenfassen! Du musst IMMER die exakte, 6-stellige Nummer (inkl. Buchstabe) aus dem Text suchen. 
 
 DOKUMENTATIONS-REGELN:
-- JEDES MATERIAL: Für JEDES gelieferte Material (egal ob Beton, Holz, Ziegel, Rohre, Türen etc.) MUSS ein Eintrag "Lieferschein / Leistungserklärung" erstellt werden.
-- JEDE ENTSORGUNG: Für JEDEN Aushub/Abbruch MUSS ein "Wiegeschein / Entsorgungsnachweis" gefordert werden.
-- DOKUMENTE SPLITTEN: Braucht eine Position Lieferschein UND Zertifikat, mache ZWEI (oder mehr) separate Einträge!
+- JEDES MATERIAL: Für JEDES gelieferte Material (egal ob Beton, Holz, Ziegel, Rohre, Türen etc.) MUSS ein allgemeingültiger Eintrag "Lieferschein / Leistungserklärung" erstellt werden.
+- JEDE ENTSORGUNG: Für JEDEN Aushub/Abbruch MUSS ein allgemeingültiger "Wiegeschein / Entsorgungsnachweis" gefordert werden.
+- DOKUMENTE SPLITTEN (SEHR WICHTIG): Braucht eine Position mehrere Dokumente (z.B. Lieferschein UND Einbaubestätigung), musst du für JEDES Dokument eine EIGENE, separate Zeile im JSON (mit derselben Positionsnummer) ausgeben! Fasse niemals mehrere Kategorien in einem Feld zusammen.
 
 ANTWORTE ZWINGEND IM JSON-FORMAT!
 Struktur: {"items": [{"stelle": "Exakte Pos-Nummer: Kurztext", "dokument": "Name des Dokuments", "logik": "Begründung", "einstufung": "Zwingend/Implizit/Potenziell"}]}
+
+### BEISPIEL FÜR PERFEKTE EXTRAKTION AUS EINEM LV ###
+USER: 00.10.25.A Sub-/Nachunternehmer zulässig ... 03.12.04 Brandschutztürelement EI2 30-C ...
+ASSISTANT: {"items": [
+  {"stelle": "Pos. 00.10.25.A: Sub-/Nachunternehmer", "dokument": "Nachweis der Befugnis und Leistungsfähigkeit", "logik": "Bieter muss Befugnisse der Subunternehmer nachweisen.", "einstufung": "Zwingend"},
+  {"stelle": "Pos. 03.12.04: Brandschutztürelement EI2 30-C", "dokument": "Lieferschein / Leistungserklärung", "logik": "Jedes Material erfordert einen Materialnachweis.", "einstufung": "Implizit"},
+  {"stelle": "Pos. 03.12.04: Brandschutztürelement EI2 30-C", "dokument": "Einbaubestätigung", "logik": "Brandschutznachweis zwingend erforderlich für Benützungsfreigabe.", "einstufung": "Zwingend"}
+]}
 """
 
-def chunk_text(text: str, chunk_size: int = 30000, overlap: int = 1000) -> list:
+def chunk_text(text: str, chunk_size: int = 30000, overlap: int = 1000):
     chunks = []
     start = 0
     while start < len(text):
-        end = start + chunk_size
-        chunks.append(text[start:end])
+        chunks.append(text[start:start + chunk_size])
         start += chunk_size - overlap
     return chunks
 
-# --- 3. DIE API-SCHNITTSTELLE ---
+# --- 6. DIE KERN-ANALYSE (Mit allen Türstehern & Speichern-Funktion) ---
 @app.post("/api/analyze")
-async def analyze_document(file: UploadFile = File(...), agent_type: str = Form(...)):
-    print(f"\n[+] Eingehende Analyseanfrage: {file.filename} (Typ: {agent_type})")
+async def analyze_document(
+    file: UploadFile = File(...), 
+    agent_type: str = Form(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    print(f"\n[+] Eingehende Analyseanfrage: {file.filename} von User: {current_user.username if current_user else 'Gast'}")
     
-    # TÜRSTEHER 1: Dateiendung
+    # Türsteher 1: Dateiendung
     if not file.filename.lower().endswith('.pdf'):
-        print("[-] Blockiert: Falsche Endung.")
-        return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Falsches Format", "logik": "Es dürfen nur PDF-Dateien hochgeladen werden.", "einstufung": "Prüfen"}]}
+        return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Falsches Format", "logik": "Nur PDF erlaubt.", "einstufung": "Prüfen"}]}
 
     tmp_file_path = None
-    MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB Limit (Schützt den RAM)
+    MAX_FILE_SIZE = 15 * 1024 * 1024 
     
     try:
-        # TÜRSTEHER 2: RAM-schonendes Streaming auf die Festplatte
+        # Türsteher 2: Dateigröße (15MB Limit) und RAM-schonend auf Festplatte streamen
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
             tmp_file_path = tmp_file.name
             content_length = 0
@@ -73,42 +189,33 @@ async def analyze_document(file: UploadFile = File(...), agent_type: str = Form(
                 content_length += len(chunk)
                 if content_length > MAX_FILE_SIZE:
                     os.remove(tmp_file_path)
-                    print("[-] Blockiert: Datei zu groß.")
-                    return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Datei zu groß", "logik": "Die Datei überschreitet das Limit von 15 MB.", "einstufung": "Prüfen"}]}
+                    return {"items": [{"stelle": "Abbruch", "dokument": "Zu groß", "logik": "Datei überschreitet 15 MB.", "einstufung": "Prüfen"}]}
                 tmp_file.write(chunk)
                 
-        # TÜRSTEHER 3: Ist es wirklich ein echtes PDF? (Checkt den Header-Code)
+        # Türsteher 3: Echter PDF-Header (Blockiert umbenannte Videos/Bilder)
         with open(tmp_file_path, 'rb') as f:
-            header = f.read(5)
-            if header != b'%PDF-':
+            if f.read(5) != b'%PDF-':
                 os.remove(tmp_file_path)
-                print("[-] Blockiert: Datei ist kein echtes PDF (Fake).")
-                return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Fake-PDF", "logik": "Die Datei ist kein echtes PDF, sondern wurde manipuliert.", "einstufung": "Prüfen"}]}
+                return {"items": [{"stelle": "Abbruch", "dokument": "Fake-PDF", "logik": "Die Datei ist kein echtes PDF.", "einstufung": "Prüfen"}]}
                 
-        # Text extrahieren
+        # Text aus PDF extrahieren
         doc = fitz.open(tmp_file_path)
         pdf_text = "\n".join([page.get_text() for page in doc])
         doc.close()
-        
-        # Festplatte wieder aufräumen
         os.remove(tmp_file_path)
 
     except Exception as e:
-        if tmp_file_path and os.path.exists(tmp_file_path):
-            os.remove(tmp_file_path)
-        print(f"[-] Blockiert: Dateifehler ({e})")
-        return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Datei defekt", "logik": f"Fehler: {str(e)}", "einstufung": "Prüfen"}]}
+        if tmp_file_path and os.path.exists(tmp_file_path): os.remove(tmp_file_path)
+        return {"items": [{"stelle": "Abbruch", "dokument": "Dateifehler", "logik": str(e), "einstufung": "Prüfen"}]}
     
     if len(pdf_text.strip()) < 20:
-        return {"items": [{"stelle": "Gesamtes Dokument", "dokument": "Kein Text", "logik": "Das PDF besteht nur aus Scans ohne lesbaren Text.", "einstufung": "Prüfen"}]}
+        return {"items": [{"stelle": "Abbruch", "dokument": "Kein Text", "logik": "Dokument besteht nur aus Bildern/Scans.", "einstufung": "Prüfen"}]}
     
     chunks = chunk_text(pdf_text)
-    print(f"[*] Dokument in {len(chunks)} Abschnitte zerschnitten. Starte iterative Analyse...")
-    
     all_items = []
     
+    # KI Analyse
     for i, chunk in enumerate(chunks):
-        print(f"    -> Analysiere Block {i+1}/{len(chunks)}...")
         try:
             response = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -119,33 +226,37 @@ async def analyze_document(file: UploadFile = File(...), agent_type: str = Form(
                     {"role": "user", "content": f"Analysiere diesen Textabschnitt:\n\n{chunk}"}
                 ]
             )
-            result = json.loads(response.choices[0].message.content)
-            extracted = result.get("items", [])
+            extracted = json.loads(response.choices[0].message.content).get("items", [])
             all_items.extend(extracted)
-            print(f"       Erfolg: {len(extracted)} Einträge gefunden.")
         except Exception as e:
-            print(f"       [-] Fehler in Block {i+1}: {e}")
+            print(f"[-] Fehler in Block {i+1}: {e}")
             
-    # --- INTELLIGENTE AUSWERTUNG DES INHALTLICHEN TÜRSTEHERS ---
-    fachfremd_eintraege = [item for item in all_items if "Fachfremd" in str(item.get("dokument", ""))]
+    # Türsteher 4 (Inhaltlich): Fachfremd-Erkennung auswerten
+    fachfremd = [i for i in all_items if "Fachfremd" in str(i.get("dokument", ""))]
+    if len(fachfremd) > 0 and len(fachfremd) == len(all_items):
+        return {"items": [{"stelle": "Inhalts-Abbruch", "dokument": "Fachfremd", "logik": "Kein bautechnischer Bezug.", "einstufung": "Prüfen"}]}
     
-    # Abbruch, wenn das Dokument komplett fachfremd ist
-    if len(fachfremd_eintraege) > 0 and len(fachfremd_eintraege) == len(all_items):
-        print("[-] Blockiert: KI hat das Dokument als völlig fachfremd eingestuft.")
-        return {"items": [{"stelle": "Inhalts-Abbruch", "dokument": "Fachfremdes Dokument", "logik": "Die KI hat erkannt, dass dieses Dokument keinen bautechnischen Bezug hat (z. B. Kochrezept, Roman).", "einstufung": "Prüfen"}]}
-    
-    # Ansonsten ignorieren wir einzelne fachfremde Chunks (z.B. Impressum) und leiten die echten Ergebnisse weiter
-    all_items = [item for item in all_items if "Fachfremd" not in str(item.get("dokument", ""))]
+    all_items = [i for i in all_items if "Fachfremd" not in str(i.get("dokument", ""))]
 
-    print(f"[+] Gesamtanalyse fertig! {len(all_items)} echte bautechnische Einträge übermittelt.")
+    # Datenbank-Speicherung für angemeldete Nutzer
+    if current_user and len(all_items) > 0:
+        new_report = Report(
+            user_id=current_user.id,
+            filename=file.filename,
+            agent_type=agent_type,
+            result_json=json.dumps(all_items)
+        )
+        db.add(new_report)
+        db.commit()
+        print(f"[+] Bericht in Datenbank für '{current_user.username}' gespeichert.")
+
     return {"items": all_items}
 
-# --- 4. FALLBACK ROUTE ---
 @app.get("/")
 async def serve_frontend():
-    if os.path.exists("delta-checker_v8.html"):
-        return FileResponse("delta-checker_v8.html")
-    return {"message": "Delta-Checker Backend läuft. Frontend wird über Netlify gehostet."}
+    if os.path.exists("delta-checker_v9.html"):
+        return FileResponse("delta-checker_v9.html")
+    return {"message": "API läuft. Frontend wird über Netlify gehostet."}
 
 if __name__ == "__main__":
     import uvicorn
