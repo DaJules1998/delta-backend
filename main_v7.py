@@ -1,5 +1,6 @@
 import os
 import json
+import tempfile
 import fitz  # PyMuPDF für schnelle PDF-Textextraktion
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,14 +8,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from openai import OpenAI
 
 # --- 1. SETUP CLOUD-READY ---
-# Holt den Key automatisch aus den Render-Umgebungsvariablen (.env)
-# Hier steht KEIN Key mehr im Klartext!
 api_key = os.environ.get("OPENAI_API_KEY")
 client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
 app = FastAPI()
 
-# Extrem wichtig für Netlify (erlaubt Anfragen von einer anderen Domain)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,34 +25,23 @@ app.add_middleware(
 SYSTEM_PROMPT = """Du bist ein österreichischer Bauingenieur (HTL Hochbau/Baumeister) und Prüfer.
 Analysiere den Text und finde JEDE EINZELNE bautechnische Nachweispflicht. 
 
+INHALTLICHER TÜRSTEHER (NOTFALL-ABBRUCH):
+Wenn der übergebene Text absolut NICHTS mit dem Bauwesen, Ausschreibungen oder bautechnischen Bescheiden zu tun hat (z. B. ein Kochrezept, ein Roman, ein privater Brief), dann brich die Analyse für diesen Abschnitt sofort ab und antworte EXAKT mit diesem JSON:
+{"items": [{"stelle": "Gesamtes Dokument", "dokument": "Abbruch: Fachfremd", "logik": "Der Text hat keinen bautechnischen Bezug.", "einstufung": "Prüfen"}]}
+
 WICHTIGSTE REGELN ZU POSITIONSNUMMERN (z.B. nach LB-HB):
 1. ÖSTERREICHISCHE POSITIONEN SIND 6-STELLIG: Eine exakte Position besteht aus 6 Ziffern und oft einem Buchstaben am Ende. Beispiele: "00.10.17", "03.12.04" oder "00.10.25.A".
-2. ABSOLUTES BÜNDELUNGSVERBOT: Du darfst NIEMALS Dokumente auf Obergruppen (wie "Pos 02" oder "Pos 03") zusammenfassen! Du musst IMMER die exakte, 6-stellige Nummer (inkl. Buchstabe) aus dem Text suchen. 
+2. ABSOLUTES BÜNDELUNGSVERBOT: Du darfst NIEMALS Dokumente auf Obergruppen zusammenfassen! Du musst IMMER die exakte, 6-stellige Nummer aus dem Text suchen. 
 
 DOKUMENTATIONS-REGELN:
 - JEDES MATERIAL: Für JEDES gelieferte Material (egal ob Beton, Holz, Ziegel, Rohre, Türen etc.) MUSS ein Eintrag "Lieferschein / Leistungserklärung" erstellt werden.
 - JEDE ENTSORGUNG: Für JEDEN Aushub/Abbruch MUSS ein "Wiegeschein / Entsorgungsnachweis" gefordert werden.
-- DOKUMENTE SPLITTEN: Braucht eine Position Lieferschein UND Zertifikat, mache ZWEI (oder mehr) separate Einträge mit derselben Positionsnummer!
+- DOKUMENTE SPLITTEN: Braucht eine Position Lieferschein UND Zertifikat, mache ZWEI (oder mehr) separate Einträge!
 
 ANTWORTE ZWINGEND IM JSON-FORMAT!
 Struktur: {"items": [{"stelle": "Exakte Pos-Nummer: Kurztext", "dokument": "Name des Dokuments", "logik": "Begründung", "einstufung": "Zwingend/Implizit/Potenziell"}]}
-
-### BEISPIEL FÜR PERFEKTE EXTRAKTION AUS EINEM LV ###
-USER: 00.10.25.A Sub-/Nachunternehmer zulässig ... 03.12.04 Brandschutztürelement EI2 30-C ...
-ASSISTANT: {"items": [
-  {"stelle": "Pos. 00.10.25.A: Sub-/Nachunternehmer zulässig", "dokument": "Nachweis der Befugnis und Leistungsfähigkeit", "logik": "Bieter muss Befugnisse der Subunternehmer nachweisen.", "einstufung": "Zwingend"},
-  {"stelle": "Pos. 03.12.04: Brandschutztürelement EI2 30-C", "dokument": "Lieferschein / Leistungserklärung", "logik": "Jedes Material erfordert einen Nachweis.", "einstufung": "Implizit"},
-  {"stelle": "Pos. 03.12.04: Brandschutztürelement EI2 30-C", "dokument": "Einbaubestätigung", "logik": "Brandschutznachweis zwingend erforderlich für Benützungsfreigabe.", "einstufung": "Zwingend"}
-]}
 """
 
-def extract_text_from_pdf(file_bytes: bytes) -> str:
-    """Extrahiert den Text aus allen Seiten des PDFs."""
-    doc = fitz.open(stream=file_bytes, filetype="pdf")
-    text = "\n".join([page.get_text() for page in doc])
-    return text
-
-# CHUNKING: Zerschneidet lange Dokumente in blöcke von ca. 10 Seiten
 def chunk_text(text: str, chunk_size: int = 30000, overlap: int = 1000) -> list:
     chunks = []
     start = 0
@@ -69,22 +56,57 @@ def chunk_text(text: str, chunk_size: int = 30000, overlap: int = 1000) -> list:
 async def analyze_document(file: UploadFile = File(...), agent_type: str = Form(...)):
     print(f"\n[+] Eingehende Analyseanfrage: {file.filename} (Typ: {agent_type})")
     
+    # TÜRSTEHER 1: Dateiendung
+    if not file.filename.lower().endswith('.pdf'):
+        print("[-] Blockiert: Falsche Endung.")
+        return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Falsches Format", "logik": "Es dürfen nur PDF-Dateien hochgeladen werden.", "einstufung": "Prüfen"}]}
+
+    tmp_file_path = None
+    MAX_FILE_SIZE = 15 * 1024 * 1024  # 15 MB Limit (Schützt den RAM)
+    
     try:
-        content = await file.read()
-        pdf_text = extract_text_from_pdf(content)
+        # TÜRSTEHER 2: RAM-schonendes Streaming auf die Festplatte
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+            tmp_file_path = tmp_file.name
+            content_length = 0
+            while chunk := await file.read(1024 * 1024):
+                content_length += len(chunk)
+                if content_length > MAX_FILE_SIZE:
+                    os.remove(tmp_file_path)
+                    print("[-] Blockiert: Datei zu groß.")
+                    return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Datei zu groß", "logik": "Die Datei überschreitet das Limit von 15 MB.", "einstufung": "Prüfen"}]}
+                tmp_file.write(chunk)
+                
+        # TÜRSTEHER 3: Ist es wirklich ein echtes PDF? (Checkt den Header-Code)
+        with open(tmp_file_path, 'rb') as f:
+            header = f.read(5)
+            if header != b'%PDF-':
+                os.remove(tmp_file_path)
+                print("[-] Blockiert: Datei ist kein echtes PDF (Fake).")
+                return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Fake-PDF", "logik": "Die Datei ist kein echtes PDF, sondern wurde manipuliert.", "einstufung": "Prüfen"}]}
+                
+        # Text extrahieren
+        doc = fitz.open(tmp_file_path)
+        pdf_text = "\n".join([page.get_text() for page in doc])
+        doc.close()
+        
+        # Festplatte wieder aufräumen
+        os.remove(tmp_file_path)
+
     except Exception as e:
-        return JSONResponse(status_code=400, content={"items": [{"stelle": "Fehler beim PDF-Lesen", "dokument": "Abbruch", "logik": str(e), "einstufung": "Prüfen"}]})
+        if tmp_file_path and os.path.exists(tmp_file_path):
+            os.remove(tmp_file_path)
+        print(f"[-] Blockiert: Dateifehler ({e})")
+        return {"items": [{"stelle": "Sicherheits-Abbruch", "dokument": "Datei defekt", "logik": f"Fehler: {str(e)}", "einstufung": "Prüfen"}]}
     
     if len(pdf_text.strip()) < 20:
-        return {"items": [{"stelle": "Gesamtes Dokument", "dokument": "Kein Text", "logik": "Das PDF besteht nur aus Fotos/Scans.", "einstufung": "Prüfen"}]}
+        return {"items": [{"stelle": "Gesamtes Dokument", "dokument": "Kein Text", "logik": "Das PDF besteht nur aus Scans ohne lesbaren Text.", "einstufung": "Prüfen"}]}
     
-    # Text in verdauliche Blöcke zerteilen
     chunks = chunk_text(pdf_text)
     print(f"[*] Dokument in {len(chunks)} Abschnitte zerschnitten. Starte iterative Analyse...")
     
     all_items = []
     
-    # Die Schleife jagt jeden Block einzeln durch die KI
     for i, chunk in enumerate(chunks):
         print(f"    -> Analysiere Block {i+1}/{len(chunks)}...")
         try:
@@ -104,15 +126,25 @@ async def analyze_document(file: UploadFile = File(...), agent_type: str = Form(
         except Exception as e:
             print(f"       [-] Fehler in Block {i+1}: {e}")
             
-    print(f"[+] Gesamtanalyse fertig! {len(all_items)} Einträge an das Frontend übermittelt.")
+    # --- INTELLIGENTE AUSWERTUNG DES INHALTLICHEN TÜRSTEHERS ---
+    fachfremd_eintraege = [item for item in all_items if "Fachfremd" in str(item.get("dokument", ""))]
+    
+    # Abbruch, wenn das Dokument komplett fachfremd ist
+    if len(fachfremd_eintraege) > 0 and len(fachfremd_eintraege) == len(all_items):
+        print("[-] Blockiert: KI hat das Dokument als völlig fachfremd eingestuft.")
+        return {"items": [{"stelle": "Inhalts-Abbruch", "dokument": "Fachfremdes Dokument", "logik": "Die KI hat erkannt, dass dieses Dokument keinen bautechnischen Bezug hat (z. B. Kochrezept, Roman).", "einstufung": "Prüfen"}]}
+    
+    # Ansonsten ignorieren wir einzelne fachfremde Chunks (z.B. Impressum) und leiten die echten Ergebnisse weiter
+    all_items = [item for item in all_items if "Fachfremd" not in str(item.get("dokument", ""))]
+
+    print(f"[+] Gesamtanalyse fertig! {len(all_items)} echte bautechnische Einträge übermittelt.")
     return {"items": all_items}
 
 # --- 4. FALLBACK ROUTE ---
 @app.get("/")
 async def serve_frontend():
-    # Wenn die Datei lokal liegt, zeige sie an. In der Cloud (Render) wird hier nur gemeldet, dass die API läuft.
-    if os.path.exists("delta_checker_v7.html"):
-        return FileResponse("delta_checker_v7.html")
+    if os.path.exists("delta-checker_v8.html"):
+        return FileResponse("delta-checker_v8.html")
     return {"message": "Delta-Checker Backend läuft. Frontend wird über Netlify gehostet."}
 
 if __name__ == "__main__":
