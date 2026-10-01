@@ -7,9 +7,10 @@ from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, sta
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel # NEU: Für sichere Datenübertragung
 from openai import OpenAI
 
-# --- NEUE IMPORTS FÜR DB & AUTH ---
+# --- IMPORTS FÜR DB & AUTH ---
 from sqlalchemy import create_engine, Column, Integer, String, Text, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from passlib.context import CryptContext
@@ -32,10 +33,12 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/login", auto_error=False)
 
 app = FastAPI()
+
+# WICHTIG: allow_credentials auf False, damit der Browser bei Registrierung/Login nicht blockiert!
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False, 
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -54,7 +57,12 @@ class Report(Base):
     filename = Column(String)
     agent_type = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
-    result_json = Column(Text) # Speichert die extrahierten Items
+    result_json = Column(Text) 
+
+# Datenmodell für die sichere Übertragung beim Registrieren
+class UserCreate(BaseModel):
+    username: str
+    password: str
 
 Base.metadata.create_all(bind=engine)
 
@@ -90,13 +98,11 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
 
 # --- 4. API-ROUTEN (ACCOUNT & HISTORIE) ---
 @app.post("/api/register")
-def register(user_data: dict, db: Session = Depends(get_db)):
-    username = user_data.get("username")
-    password = user_data.get("password")
-    if db.query(User).filter(User.username == username).first():
+def register(user_data: UserCreate, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.username == user_data.username).first():
         raise HTTPException(status_code=400, detail="Benutzername bereits vergeben.")
     
-    new_user = User(username=username, hashed_password=get_password_hash(password))
+    new_user = User(username=user_data.username, hashed_password=get_password_hash(user_data.password))
     db.add(new_user)
     db.commit()
     return {"message": "Account erfolgreich erstellt!"}
@@ -254,8 +260,6 @@ async def analyze_document(
 
 @app.get("/")
 async def serve_frontend():
-    if os.path.exists("delta-checker_v9.html"):
-        return FileResponse("delta-checker_v9.html")
     return {"message": "API läuft. Frontend wird über Netlify gehostet."}
 
 if __name__ == "__main__":
