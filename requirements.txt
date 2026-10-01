@@ -3,3 +3,6 @@ uvicorn
 pymupdf
 python-multipart
 openai
+sqlalchemy
+passlib[bcrypt]
+python-jose
