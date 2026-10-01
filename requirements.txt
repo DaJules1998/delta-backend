@@ -4,5 +4,6 @@ pymupdf
 python-multipart
 openai
 sqlalchemy
-passlib[bcrypt]
 python-jose
+passlib
+bcrypt==3.2.2
